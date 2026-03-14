@@ -3,10 +3,8 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/afjuiekafdjsf/nexus-dm/db"
@@ -37,34 +35,10 @@ type Room struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// In-memory room subscriptions for WebSocket broadcast
-var (
-	roomsMu   sync.RWMutex
-	roomConns = map[string]map[*websocket.Conn]bool{} // roomID -> set of conns
-)
-
-func addConn(roomID string, conn *websocket.Conn) {
-	roomsMu.Lock()
-	defer roomsMu.Unlock()
-	if roomConns[roomID] == nil {
-		roomConns[roomID] = map[*websocket.Conn]bool{}
-	}
-	roomConns[roomID][conn] = true
-}
-
-func removeConn(roomID string, conn *websocket.Conn) {
-	roomsMu.Lock()
-	defer roomsMu.Unlock()
-	delete(roomConns[roomID], conn)
-}
-
-func broadcastToRoom(roomID string, data []byte) {
-	roomsMu.RLock()
-	defer roomsMu.RUnlock()
-	for conn := range roomConns[roomID] {
-		conn.WriteMessage(websocket.TextMessage, data)
-	}
-	// Also publish to Redis pub/sub for multi-instance support
+func publishToRoom(roomID string, data []byte) {
+	// Always use Redis pub/sub as the single delivery mechanism.
+	// Each connection's subscriber goroutine delivers to the client,
+	// avoiding double-send when both in-memory and Redis would fire.
 	if RDB != nil {
 		RDB.Publish(context.Background(), "dm:"+roomID, string(data))
 	}
@@ -164,17 +138,12 @@ func WebSocketHandler(c *gin.Context) {
 	}
 	defer conn.Close()
 
-	addConn(roomID, conn)
-	defer removeConn(roomID, conn)
-
-	// Subscribe to Redis pub/sub for this room (messages from other instances)
-	var redisSub *redis.PubSub
+	// Subscribe to Redis pub/sub — sole delivery path to avoid duplicates
 	if RDB != nil {
-		redisSub = RDB.Subscribe(context.Background(), "dm:"+roomID)
+		redisSub := RDB.Subscribe(context.Background(), "dm:"+roomID)
 		defer redisSub.Close()
 		go func() {
-			ch := redisSub.Channel()
-			for msg := range ch {
+			for msg := range redisSub.Channel() {
 				conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload))
 			}
 		}()
@@ -206,7 +175,6 @@ func WebSocketHandler(c *gin.Context) {
 		}
 
 		data, _ := json.Marshal(m)
-		fmt.Sprintf("broadcasting to room %s", roomID)
-		broadcastToRoom(roomID, data)
+		publishToRoom(roomID, data)
 	}
 }
