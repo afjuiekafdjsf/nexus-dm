@@ -1,10 +1,10 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/afjuiekafdjsf/nexus-dm/db"
@@ -35,32 +35,9 @@ type Room struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// In-memory registry: roomID → set of WebSocket connections
-var (
-	roomsMu   sync.RWMutex
-	roomConns = map[string]map[*websocket.Conn]bool{}
-)
-
-func addConn(roomID string, conn *websocket.Conn) {
-	roomsMu.Lock()
-	defer roomsMu.Unlock()
-	if roomConns[roomID] == nil {
-		roomConns[roomID] = map[*websocket.Conn]bool{}
-	}
-	roomConns[roomID][conn] = true
-}
-
-func removeConn(roomID string, conn *websocket.Conn) {
-	roomsMu.Lock()
-	defer roomsMu.Unlock()
-	delete(roomConns[roomID], conn)
-}
-
-func broadcastToRoom(roomID string, data []byte) {
-	roomsMu.RLock()
-	defer roomsMu.RUnlock()
-	for conn := range roomConns[roomID] {
-		conn.WriteMessage(websocket.TextMessage, data)
+func publishToRoom(roomID string, data []byte) {
+	if RDB != nil {
+		RDB.Publish(context.Background(), "dm:"+roomID, string(data))
 	}
 }
 
@@ -158,8 +135,16 @@ func WebSocketHandler(c *gin.Context) {
 	}
 	defer conn.Close()
 
-	addConn(roomID, conn)
-	defer removeConn(roomID, conn)
+	// Subscribe to Redis pub/sub for this room (sole delivery path — avoids double-send)
+	if RDB != nil {
+		redisSub := RDB.Subscribe(context.Background(), "dm:"+roomID)
+		defer redisSub.Close()
+		go func() {
+			for msg := range redisSub.Channel() {
+				conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload))
+			}
+		}()
+	}
 
 	for {
 		_, msgBytes, err := conn.ReadMessage()
@@ -187,6 +172,6 @@ func WebSocketHandler(c *gin.Context) {
 		}
 
 		data, _ := json.Marshal(m)
-		broadcastToRoom(roomID, data)
+		publishToRoom(roomID, data)
 	}
 }
